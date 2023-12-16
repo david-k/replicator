@@ -2,6 +2,7 @@ import os
 import sys
 import stat
 from pathlib import Path
+import hashlib
 import sqlite3
 import dataclasses
 from dataclasses import dataclass, field
@@ -123,6 +124,9 @@ from pprint import pprint
 # 
 
 
+BLOB_SIZE = 15*1024*1024
+
+
 # Types
 #===================================================================================================
 class FileKind(Enum):
@@ -165,6 +169,27 @@ class File(FileMeta):
     blobs: list[bytes] = field(default_factory=list)
 
 
+@dataclass(kw_only=True)
+class DBFileMeta(FileMeta):
+    id: int
+
+
+@dataclass(kw_only=True)
+class DBFile(DBFileMeta, File):
+    pass
+
+
+def eq_metadata(a: FileMeta, b: FileMeta) -> bool:
+    for (k, v) in a.__dict__.items():
+        if k == "id":
+            continue
+
+        if v != b.__dict__[k]:
+            return False
+
+    return True
+
+
 
 # DB utils
 #===================================================================================================
@@ -176,7 +201,7 @@ def db_update(cursor: sqlite3.Cursor, table: str, data: dict, where: str):
     cursor.execute("update " + table + " set " + ", ".join(assignments) + " where " + where, data)
 
 
-def db_insert(cursor: sqlite3.Cursor, table: str, data: dict):
+def db_insert(cursor: sqlite3.Cursor, table: str, data: dict) -> int:
     col_names = data.keys()
     col_placeholders = [":" + col for col in col_names]
 
@@ -185,9 +210,43 @@ def db_insert(cursor: sqlite3.Cursor, table: str, data: dict):
         data
     )
 
+    return cursor.lastrowid # type: ignore
+
 
 # Utils
 #===================================================================================================
+def compute_blobs(filepath: Path) -> list:
+    blobs = []
+    with open(filepath, "rb") as file:
+        while data := file.read(BLOB_SIZE):
+            m = hashlib.sha256()
+            m.update(data)
+            hash_bytes = m.digest()
+            blobs.append((hash_bytes, len(data)))
+
+    return blobs
+
+
+def db_insert_blobs(cursor: sqlite3.Cursor, blobs: list) -> list[int]:
+    blob_ids = []
+    for (digest, size) in blobs:
+        cursor.execute(
+            "insert into blobs(hash, size) values(?, ?) on conflict(hash) do nothing",
+            (digest, size)
+        )
+        blob_id = cursor.execute("select id from blobs where hash = ?", (digest,)).fetchone()["id"]
+        blob_ids.append(blob_id)
+
+    return blob_ids
+
+
+def db_assign_blobs_to_local_file(cursor: sqlite3.Cursor, file_id: int, blob_ids: list[int]):
+    cursor.execute("delete from local_file_blobs where file_id = ?", (file_id,))
+
+    for blob_id in blob_ids:
+        cursor.execute("insert into local_file_blobs(file_id, blob_id) values(?, ?)", (file_id, blob_id))
+
+
 # `p` may be str, bytes or any PathLike
 # If `r` is a Path object, use `bytes(r)` to get its bytes representation
 def mk_path(p):
@@ -207,7 +266,7 @@ def file_kind_to_db(kind: FileKind):
     raise RuntimeError("Invalid file kind: " + str(kind))
 
 
-def db_try_load_local_file(cursor: sqlite3.Cursor, filepath: Path) -> Optional[FileMeta]:
+def db_try_load_local_file(cursor: sqlite3.Cursor, filepath: Path) -> Optional[DBFileMeta]:
     db_file = cursor.execute(
         "select * from local_files where filepath = :filepath",
         {"filepath": bytes(filepath)}
@@ -217,7 +276,8 @@ def db_try_load_local_file(cursor: sqlite3.Cursor, filepath: Path) -> Optional[F
         return None
 
 
-    return FileMeta(
+    return DBFileMeta(
+        id = db_file["id"],
         filepath=mk_path(db_file["filepath"]),
         kind=FILE_KIND_TABLE[db_file["kind"]],
         mtime=db_file["mtime"],
@@ -247,7 +307,7 @@ def db_update_local_file(cursor: sqlite3.Cursor, data: dict):
     db_update(cursor, "local_files", db_prepare_local_file_data(data), "filepath = :filepath")
 
 def db_insert_local_file(cursor: sqlite3.Cursor, data: dict):
-    db_insert(cursor, "local_files", db_prepare_local_file_data(data))
+    return db_insert(cursor, "local_files", db_prepare_local_file_data(data))
 
 
 
@@ -285,7 +345,8 @@ def refresh_db_from_fs(cursor: sqlite3.Cursor, repo_root: Path):
     # TODO If st_dev of repo_root has changed, remove all local_files
 
 
-    num_changes = 0
+    num_file_metadata_changes = 0
+    num_file_hash_recomputed = 0
     for (path, dirnames, filenames) in os.walk(repo_root):
         for filename in filenames:
             filepath = mk_path(path).joinpath(mk_path(filename))
@@ -299,15 +360,22 @@ def refresh_db_from_fs(cursor: sqlite3.Cursor, repo_root: Path):
 
             rel_path = filepath.relative_to(mk_path(repo_root))
             db_file = db_try_load_local_file(cursor, rel_path)
-
             fs_file = file_from_stat(repo_root, rel_path, stat_res)
-            if fs_file == db_file:
+
+            if db_file and eq_metadata(fs_file, db_file):
                 # Nothing has changed. Just mark the file as still existing
                 cursor.execute("update local_files set still_exists = 1 where filepath = ?", (bytes(rel_path),))
             else:
                 new_file_data = dataclasses.asdict(fs_file)
                 new_file_data["still_exists"] = 1
 
+                if db_file:
+                    db_update_local_file(cursor, new_file_data)
+                    file_id = db_file.id
+                else:
+                    file_id = db_insert_local_file(cursor, new_file_data)
+
+                # If the file contents may have been modified we need to recompute the blob hashes
                 if fs_file.kind == FileKind.REGULAR:
                     content_may_be_modified = (
                         not db_file or (
@@ -318,30 +386,42 @@ def refresh_db_from_fs(cursor: sqlite3.Cursor, repo_root: Path):
                         )
                     )
                     if content_may_be_modified:
-                        # TODO Compute blob hashes
-                        pass
+                        blobs = compute_blobs(filepath)
+                        blob_ids = db_insert_blobs(cursor, blobs)
+                        db_assign_blobs_to_local_file(cursor, file_id, blob_ids)
 
-                if db_file:
-                    db_update_local_file(cursor, new_file_data)
-                else:
-                    db_insert_local_file(cursor, new_file_data)
+                        num_file_hash_recomputed += 1
 
-                num_changes += 1
+                num_file_metadata_changes += 1
                 print("Updating " + str(rel_path))
 
 
+    # Delete unused files
+    cursor.execute("delete from local_files where still_exists = 0")
+    num_files_deleted = cursor.rowcount
 
+    # Delete unused blobs
+    cursor.execute(
+        """delete from blobs as b
+        where
+            (not exists(select * from local_file_blobs where blob_id = b.id)) and
+            (not exists(select * from remote_file_blobs where blob_id = b.id))"""
+    )
+    num_blobs_deleted = cursor.rowcount
 
-    db.execute("delete from local_files where still_exists = 0")
     db.commit()
 
-    print(str(num_changes) + " updates")
+    print(str(num_file_metadata_changes) + " file metadata updates")
+    print(str(num_file_hash_recomputed) + " file hashes recomputed")
+    print(str(num_files_deleted) + " files deleted")
+    print(str(num_blobs_deleted) + " blobs deleted")
 
 
 
 # MAIN
 #===================================================================================================
 db = sqlite3.connect("test.db")
+db.execute("PRAGMA foreign_keys = ON")
 db.row_factory = sqlite3.Row
 cursor = db.cursor()
 

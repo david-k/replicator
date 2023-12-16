@@ -6,6 +6,7 @@ create table blobs(
 	id integer primary key,
 
 	bundle_uuid text, -- May be null if the blob has not been assigned to a bundle yet
+	size integer not null,
 	hash text not null,
 
 	constraint UK__blobs__hash unique(hash),
@@ -35,9 +36,10 @@ create table remote_file_blobs(
 	file_id integer not null,
 	blob_id integer not null,
 
-	constraint FK__remote_file_blobs__file_id foreign key(file_id) references remote_files(id),
+	constraint FK__remote_file_blobs__file_id foreign key(file_id) references remote_files(id) on delete cascade,
 	constraint FK__remote_file_blobs__blob_id foreign key(blob_id) references blobs(id)
 );
+create index remote_file_blobs__blob_id on remote_file_blobs(blob_id);
 
 
 create table local_files(
@@ -67,6 +69,7 @@ create table local_file_blobs(
 	file_id integer not null,
 	blob_id integer not null,
 
-	constraint FK__local_file_blobs__file_id foreign key(file_id) references remote_files(id),
+	constraint FK__local_file_blobs__file_id foreign key(file_id) references local_files(id) on delete cascade,
 	constraint FK__local_file_blobs__blob_id foreign key(blob_id) references blobs(id)
 );
+create index local_file_blobs__blob_id on local_file_blobs(blob_id);
