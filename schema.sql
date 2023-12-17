@@ -21,9 +21,10 @@ create table remote_files(
 	kind char not null, -- d: directory, f: regular file, l: symbolic link
 
 	-- Only used if kind=f
-	fsize integer,
+	size integer,
 	mtime integer,
 	executable integer,
+	combined_hash blob,
 
 	-- Only used if kind=l
 	link_target blob,
@@ -40,6 +41,7 @@ create table remote_file_blobs(
 	constraint FK__remote_file_blobs__blob_id foreign key(blob_id) references blobs(id)
 );
 create index remote_file_blobs__blob_id on remote_file_blobs(blob_id);
+create index remote_file_blobs__file_id on remote_file_blobs(file_id);
 
 
 create table local_files(
@@ -54,6 +56,7 @@ create table local_files(
 	ctime integer,
 	inode integer,
 	executable integer,
+	combined_hash blob,
 
 	-- Only used if kind=l
 	link_target blob,
@@ -73,3 +76,4 @@ create table local_file_blobs(
 	constraint FK__local_file_blobs__blob_id foreign key(blob_id) references blobs(id)
 );
 create index local_file_blobs__blob_id on local_file_blobs(blob_id);
+create index local_file_blobs__file_id on local_file_blobs(file_id);
