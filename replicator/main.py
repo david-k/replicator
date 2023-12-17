@@ -16,6 +16,14 @@ from enum import Enum
 # - https://mountainduck.io/ (encrypted file sync via S3 (among others))
 
 
+
+# I'm pretty sure I can use ROW_NUMBER()
+# (https://www.sqltutorial.org/sql-window-functions/sql-row_number/) to assign the order to each
+# local_files row
+# - ROW_NUMBER() is a window function. I haven't heard of them yet but they seem very useful
+
+
+
 # Remote
 # ======
 # - The remote stores two kind of files: bundle files and index files
@@ -336,7 +344,7 @@ def file_from_stat(repo_root: Path, rel_path: Path, stat_res: os.stat_result) ->
     return FileMeta(
         filepath = rel_path,
         kind = kind,
-        mtime = int(stat_res.st_mtime), # TODO Why does pywright think st_mtime and st_ctime are of type float?
+        mtime = int(stat_res.st_mtime), # TODO Why does pyright think st_mtime and st_ctime are of type float?
         ctime = int(stat_res.st_ctime),
         size = size,
         inode = stat_res.st_ino,
@@ -350,7 +358,7 @@ def refresh_db_from_fs(db: sqlite3.Connection, repo_root: Path):
     cursor = db.cursor()
 
     # First, mark all local_files as non-existing
-    cursor.execute("update local_files set still_exists = 0");
+    cursor.execute("update local_files set still_exists = 0")
 
     # TODO If st_dev of repo_root has changed, remove all local_files
 
@@ -464,6 +472,59 @@ def compare_local_with_remote(db: sqlite3.Connection):
     print("Files delelted: " + str(len(deleted_files)))
 
 
+def assign_blobs_to_bundles(db: sqlite3.Connection):
+    cursor = db.cursor()
+
+    # Create temp table `ordered_blobs(blob_id, filepath)` that stores for each blob the smallest
+    # filepath (in lexicographical order) that is associated with that blob
+    cursor.executescript(
+        """drop table if exists ordered_blobs;
+
+        create temp table ordered_blobs(
+            blob_id integer primary key,
+            filepath blob,
+            bundle_uuid blob,
+            hash blob,
+            size integer
+        );
+
+        insert into ordered_blobs(blob_id, filepath, bundle_uuid, hash, size)
+        select blobs.id, min(local_files.filepath), blobs.bundle_uuid, blobs.hash, blobs.size
+        from local_file_blobs
+        inner join local_files on local_files.id = local_file_blobs.file_id
+        inner join blobs on blobs.id = local_file_blobs.blob_id
+        group by local_file_blobs.blob_id
+        order by min(local_files.filepath);"""
+    )
+
+
+    # Get a list of all bundles, ordered by the first file (in lexicographical order) that has a
+    # blob associated with the bundle
+    ordered_bundles = cursor.execute(
+        """select
+            bundles.uuid, min(ordered_blobs.filepath), sum(ordered_blobs.size) as size
+        from bundles
+        left join ordered_blobs on ordered_blobs.bundle_uuid = bundles.uuid
+        group by bundles.uuid
+        order by min(ordered_blobs.filepath)"""
+    ).fetchall()
+
+    bundles_by_uuid = {}
+    for bundle in ordered_bundles:
+        bundles_by_uuid[bundle["uuid"]] = {"size": bundle["size"]}
+
+
+    # Get a list of all bundles, ordered by the first file (in lexicographical order) that has a
+    # blob associated with the bundle
+    ordered_blobs = cursor.execute(
+        """select ordered_blobs.blob_id, ordered_blobs.filepath from ordered_blobs
+        order by ordered_blobs.filepath"""
+    )
+
+    for blob in ordered_blobs:
+        pass
+
+
 # MAIN
 #===================================================================================================
 def main():
@@ -472,7 +533,8 @@ def main():
     db.row_factory = sqlite3.Row
 
     #refresh_db_from_fs(db, mk_path(sys.argv[1]))
-    compare_local_with_remote(db)
+    #compare_local_with_remote(db)
+    assign_blobs_to_bundles(db)
 
 
 main()
